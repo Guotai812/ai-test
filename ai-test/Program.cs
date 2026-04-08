@@ -1,51 +1,59 @@
-using Azure;
-using Azure.AI.OpenAI;
+using System.ComponentModel;
+using Azure.AI.Projects;
+using Azure.Identity;
 using Microsoft.Agents.AI;
-using Microsoft.Agents.AI.Hosting;
 using Microsoft.Extensions.AI;
 
 var builder = WebApplication.CreateBuilder(args);
 
-var apiKey = builder.Configuration["Azure:ApiKey"]
-    ?? throw new InvalidOperationException("Azure:ApiKey is not set.");
 var endpoint = builder.Configuration["Azure:Endpoint"]
     ?? throw new InvalidOperationException("Azure:Endpoint is not set.");
-var deploymentName = builder.Configuration["Azure:DeploymentName"]
-    ?? throw new InvalidOperationException("Azure:DeploymentName is not set.");
+var deploymentName = builder.Configuration["Azure:AiModels:TaskGeneration:DeploymentId"]
+    ?? throw new InvalidOperationException("Azure:AiModels:TaskGeneration:DeploymentId is not set.");
 
-IChatClient chatClient = new AzureOpenAIClient(
-        new Uri(endpoint),
-        new AzureKeyCredential(apiKey))
-    .GetChatClient(deploymentName)
-    .AsIChatClient();
-builder.Services.AddSingleton(chatClient);
+AIFunction createTaskFn = AIFunctionFactory.Create(
+    (
+        [Description("The title or description of the task")] string title,
+        [Description("The date reference, e.g. 'tomorrow', '2nd January', 'next Monday'")] string date,
+        [Description("The time reference, e.g. '3pm', '15:00'. Use 'unspecified' if no time mentioned.")] string time
+    ) => new TaskResult("task", title, date, time),
+    name: "create_task",
+    description: "Call this when the input contains a date or time reference — it is a schedulable task.");
 
-var taskAgent = builder.AddAIAgent(
-    "taskAnalyzer",
-    instructions: """
-        You analyze text and detect if it contains any date or time reference.
-        If the text contains a date or time (e.g. "7pm", "2nd January", "tomorrow", "next Monday"),
-        respond ONLY in this exact format: task on {date} at {time}
-        - If only a date is mentioned with no time, use "unspecified time"
-        - If only a time is mentioned with no date, use "today"
-        If the text contains NO date or time reference, respond ONLY with: this is a note
-        Do not add any other text or explanation.
-        """);
+AIFunction createNoteFn = AIFunctionFactory.Create(
+    (
+        [Description("The full content of the note")] string content
+    ) => new NoteResult("note", content),
+    name: "create_note",
+    description: "Call this when the input has no date or time reference — it is a plain note.");
+
+AIAgent agent = new AIProjectClient(new Uri(endpoint), new DefaultAzureCredential())
+    .AsAIAgent(
+        model: deploymentName,
+        instructions: """
+            You classify user input by calling the appropriate function.
+            Always call either create_task or create_note. Never respond with plain text.
+            """,
+        tools: [createTaskFn, createNoteFn]);
 
 var app = builder.Build();
 
-app.MapPost("/analyze", async (
-    AnalyzeRequest request,
-    [FromKeyedServices("taskAnalyzer")] AIAgent agent) =>
+app.MapPost("/analyze", async (AnalyzeRequest request) =>
 {
     var response = await agent.RunAsync(request.Text);
-    var text = response.Messages
+
+    var result = response.Messages
         .SelectMany(m => m.Contents)
-        .OfType<Microsoft.Extensions.AI.TextContent>()
-        .FirstOrDefault()?.Text ?? "no response";
-    return Results.Ok(new { result = text });
+        .OfType<FunctionResultContent>()
+        .FirstOrDefault()?.Result;
+
+    return result is not null
+        ? Results.Ok(result)
+        : Results.Problem("Agent did not call a function.");
 });
 
 app.Run();
 
 record AnalyzeRequest(string Text);
+record TaskResult(string Type, string Title, string Date, string Time);
+record NoteResult(string Type, string Content);
